@@ -1,0 +1,324 @@
+#!/usr/bin/perl
+
+use strict;
+
+use DBI;
+use Getopt::Declare;
+use Time::HiRes qw/tv_interval/;
+
+# put defaults here
+our $source_host;
+our $backup_root;
+our $post_mysql_init_file;
+our $MysqlRoot = '/var/lib/mysql';
+our $nfsmount;
+our $init;
+our $BackupDir;
+our @RestoreItems = ();
+our @Tables = ();
+our $Verbose;
+
+$SIG{INT}     = \&unlock_source;
+$SIG{__DIE__} = \&unlock_source;
+
+$| = 1;
+
+my $specification = q(
+	-m <host>		host which has a good master db, defaults to restoreslave cname
+				{ $::source_host = $host }
+	-M <nfsmount>		mount a host:mountpoint from which to retrieve a restore copy
+				{ $::nfsmount = $nfsmount }
+	-i			run as part of the mysql init script.
+				{$::init = 1 }
+	-D <dbs>...		restore this list of DBs.  Default is to check currently running mysql instance.
+				{ @::RestoreItems = @dbs }
+	-T <tables>...		Specific tables to restore
+				{ @::RestoreItems = @tables }
+	-b <backup_dir>		specify location of backup directory
+				{ $::BackupDir = $backup_dir }
+	-v			verbose
+				{ $::Verbose++ }
+);
+my $args = Getopt::Declare->new($specification);
+
+# get the mysql root password
+my $password = `cat /etc/.mysql_root` | $ENV{MYSQL_PWD};
+chomp $password;
+die "No mysql root password available" unless $password;
+
+# determine if we are doing a hot restore or just swapping out files; get dbs to restore
+my $mysql_not_running;
+my $mysql_restart;
+my $dbh = dbh();
+if (not $dbh) {
+    msg("Could not connect to localhost. Will use my.cnf to determine which dbs and tables to restore.\n");
+    $mysql_not_running++;
+    if (not @RestoreItems) {
+        @RestoreItems = slave_info_from_conf();
+    }
+}
+else {
+    OK(); 
+    if (not @RestoreItems) {
+	msg('Getting slave status to determine which databases to restore ...');
+	my $state = $dbh->selectrow_hashref('show slave status'); 
+	OK();
+        if ($state->{Replicate_Do_DB}) {
+            @RestoreItems = split(/\,/,$state->{Replicate_Do_DB});
+        }
+        elsif ($state->{Replicate_Do_Table}) {
+            @RestoreItems = split(/\,/,$state->{Replicate_Do_Table});
+        }
+        else {
+            msg("No slave staus available even though mysql running.  Will try to get slave information from my.cnf and restart server.");
+	    @RestoreItems = slave_info_from_conf();
+            if (@RestoreItems) {
+               msg("Looks like a slave server, but currently running mysql does not reflect.\n");
+               msg("Stopping mysql and doing a cold restore\n");
+               my $stop = `/etc/init.d/mysql stop`;
+               die "Could not stop mysql" if $?;
+               $mysql_not_running++;
+               $mysql_restart++;
+            }
+            OK();
+        }
+    }
+}
+
+die "No databases could be found to restore" if not @RestoreItems;
+
+msg("Restoring " . join(', ', @RestoreItems) . "\n");
+
+# mount backup directory if we are doing an nfs restore
+if ($nfsmount) {
+    msg("Mounting $nfsmount to /mnt/cdrom ...");
+    my $mount = `mount $nfsmount /mnt/cdrom`;
+    die "Count not mount $nfsmount: $mount" if $?;
+    $backup_root = '/mnt/cdrom';
+    OK();
+}
+
+# find the most recent dump on source_host
+msg("Finding the most recent backup ... ");
+my $data_dir;
+if ($BackupDir) {
+    $data_dir = $BackupDir;
+}
+elsif ($nfsmount) {
+    $data_dir = $backup_root . '/' . readlink("$backup_root/latest");
+}
+else {
+    $data_dir = `ssh web\@$source_host 'readlink $backup_root/latest'`;
+    die "Could not connect to remote host $source_host to find backup" if $?;
+    chomp($data_dir);
+}
+msg("using $data_dir\n");
+
+msg("Loading slave status information ...");
+my $state_file = $nfsmount ? "$data_dir/state.xml" : '/tmp/state.xml';
+if (not $nfsmount) {
+    my $scp = `scp web\@$source_host:$data_dir/state.xml $state_file`;
+    die "Can't get state: $scp" if $?;
+}
+my $source_state = parse_state_file($state_file);
+OK();
+
+if ($mysql_not_running) {
+    cold_restore();
+    if ($mysql_restart) {
+        msg("Restarting mysql ... ");
+        my $start = `/etc/init.d/mysql start`;
+        OK();
+        verify_slave();
+    }
+}
+else {
+    hot_restore();
+    if (not verify_slave()) {
+        msg("Stoppping mysql server instance and attemping cold restore ... ");
+        my $stop = `/etc/init.d/mysql stop`;
+        die "Could not stop mysql" if $?;
+        OK();
+        cold_restore();
+
+        msg("Restarting mysql ... ");
+        my $start = `/etc/init.d/mysql start`;
+        die "Could not restore even with cold restore!" if not verify_slave();
+        OK();
+    }
+}
+
+`umount -t nfs /mnt/cdrom` if $nfsmount;
+        
+sub hot_restore {
+    msg("Stopping the local mysql slave ...");
+    $dbh->do('stop slave');
+    die $dbh->errstr if $dbh->err;
+    OK();
+
+    msg("Locking tables ...");
+    $dbh->do('flush tables with read lock');
+    die $dbh->errstr if $dbh->err;
+    OK();
+
+    copy_files();
+
+    $dbh = dbh();
+    msg("Changing master position to $source_state->{master_file}:$source_state->{master_position}... ");
+    $dbh->do("reset slave");
+    sleep 1; 
+    $dbh->do("change master to master_host='$source_state->{master_host}', master_log_file='$source_state->{master_file}',master_log_pos=$source_state->{master_position}");
+    die $dbh->errstr if $dbh->err;
+    OK();
+
+    msg("Unlocking tables ...");
+    $dbh->do("unlock tables");
+    die $dbh->errstr if $dbh->err;
+    OK();
+
+    msg("Starting slave ...");
+    $dbh->do('start slave');
+    die $dbh->errstr if $dbh->err;
+    OK();
+}
+
+sub cold_restore {
+    open(MASTER,"$MysqlRoot/master.info");
+    my @master = <MASTER>;
+    chomp @master;
+    close MASTER;
+
+    my $rm = `rm -f $MysqlRoot/master.info $MysqlRoot/relay-log.info $MysqlRoot/*relay-bin*`;
+    copy_files();
+
+    $master[1] = $source_state->{master_file};
+    $master[2] = $source_state->{master_position};
+    $master[3] = $source_state->{master_host};
+    open(OUT,">$MysqlRoot/master.info");
+    map { print OUT "$_\n" } @master;
+    close OUT; 
+    `chown mysql:mysql $MysqlRoot/master.info`;
+    
+    #print OUT "stop slave;\n";
+    #print OUT "change master to master_log_file='$source_state->{master_file}',master_log_pos=$source_state->{master_position};\n";
+    #print OUT "start slave;\n";
+    #`chown web:web $post_mysql_init_file`;
+}
+
+sub verify_slave {
+    msg("Verifying clean restore\n");
+    my $status = {};
+    for (my $i=0;$i<5;$i++) {
+	$status = slave_status();
+	sleep 1;
+    }
+
+    if ($status->{Slave_SQL_Running} =~ /no/i or $status->{Slave_IO_Running} =~ /no/i) {
+	msg("Last ditch attempt to save ...");
+	$dbh->do("stop slave");
+	sleep 1;
+	$dbh->do("flush tables");
+	sleep 1;
+	$dbh->do("set global sql_slave_skip_counter=1");
+	$dbh->do("start slave");
+        OK();
+	for (my $i=0;$i<5;$i++) {
+	    $status = slave_status();
+	    sleep 1;
+	}
+        return if $status->{Slave_SQL_Running} =~ /no/i;
+        return if $status->{Slave_IO_Running} =~ /no/i;
+    }
+
+    msg("Looks gud ... its alright for the slave to behind 1000 seconds or so\n");
+    return 1;
+}
+
+sub parse_state_file {
+    my $file = shift;
+    my $state = {};
+    open(STATE,$file);
+    while(<STATE>) {
+        if (/<database>(.*?)<\/database>/) {
+            push @{$state->{databases}},$1;
+        }
+        elsif (/<(.*?)>(.*?)<\/.*>/) {
+            $state->{$1} = $2;
+        }
+    }
+    close STATE;
+    return $state;
+}
+
+sub OK {
+    print "[OK]\n" if $Verbose;
+}
+
+sub msg {
+    print shift if $Verbose;
+}
+
+sub slave_info_from_conf {
+    open(CNF,'/etc/my.cnf');
+    while(<CNF>) {
+       chomp();
+       if (/replicate-do/) {
+	   s/\s+//g;
+	   /replicate-do-.*?=(.*)/;
+	   push @RestoreItems,$1;
+       }
+    }
+    return @RestoreItems;
+}
+
+sub slave_status {
+    my $status = $dbh->selectrow_hashref('show slave status');
+    msg("Slave SQL/IO Run:      $status->{Slave_SQL_Running}/$status->{Slave_IO_Running}\n");
+    msg("Seconds_behind_master: $status->{Seconds_Behind_Master}\n");
+    return $status;
+}
+
+sub copy_files {
+    foreach my $item (@RestoreItems) {
+	my $tables = "$item/*";
+	my $target_dir = "$item/";
+	if ($item =~ /\./) {
+	    $tables = $item;
+	    $tables =~ s/\./\//;
+	    $target_dir = $item;
+	    $target_dir =~ s/\..*?$/\//;
+	}
+
+	msg("Installing fresh copy of $item\n");
+	my $rm = `rm -f $MysqlRoot/$tables.MYI $MysqlRoot/$tables.MYD $MysqlRoot/$tables.frm`;
+	warn "unable to remove $MysqlRoot/$tables table information" if $?;
+
+        my $mkdir = `mkdir -p $MysqlRoot/$target_dir`;
+        die "Could not mkdir $MysqlRoot/$target_dir" if $?;
+
+	if ($nfsmount) {
+	    my $cp = `cp -p $data_dir/$tables $MysqlRoot/$target_dir`;
+	    die "cp of mysql files failed! $cp" if $?;
+	}
+	else {
+	    my $scp = `scp -p web\@$source_host:$data_dir/$tables\.* $MysqlRoot/$target_dir`;
+	    die "scp of mysql files failed! $scp" if $?;
+	}
+	my $chown = `chown mysql:mysql -R $MysqlRoot/$target_dir`;
+    }
+}
+
+sub dbh {
+    my $connect;
+    if (!$dbh) {
+        $connect++;
+    }
+    elsif (not $dbh->ping) {
+        $connect++;
+    }
+    if ($connect) {
+        msg("Connecting to mysql localhost..."); 
+        $dbh = DBI->connect("DBI:mysql:host=localhost",'root',$password);
+    }
+    return $dbh;
+}

@@ -1,0 +1,70 @@
+#!/usr/bin/perl
+
+use strict;
+use Getopt::Declare;
+use DBI;
+
+our $Column;
+our @NewValues = ();
+our $DB;
+our $Table;
+our $TempDB = 'ourtempdb';
+
+my @effective_user_info = getpwuid($>);
+my $effective_user = shift @effective_user_info;
+die "must run as root" unless $effective_user eq 'root';
+
+my $specification = q(
+	-T		will run in test mode
+			{ $::Test = 1 }
+	-d <database>	database on which to run the enum addition
+			{ $::DB = $database }
+	-t <table>	table on which to operate
+			{ $::Table = $table }
+	-c <column>	column to add new enums to
+			{ $::Column = $column }
+	-v <values>...	list of values to append to enum col
+			{ @::NewValues = @values }
+);
+Getopt::Declare->new($specification);
+
+my $mysql_password = $ENV{MYSQL_PWD} || `cat /etc/.mysql_root`;
+chomp $mysql_password;
+
+my $dbh = DBI->connect('DBI:mysql:mysql','root',$mysql_password) or die $@;
+$dbh->do("create database if not exists $TempDB") or die "could not create database $TempDB";
+$dbh->do("use $TempDB") or die "could not use $TempDB";
+my $global_variables = $dbh->selectall_hashref('show global variables','Variable_name');
+my $data_dir = $global_variables->{datadir}->{Value};
+my $current_table_definition = $dbh->selectrow_arrayref("show create table $DB.$Table");
+if (not $current_table_definition->[1]) {
+    die "Could not find $Table on $DB";
+}
+my @new_values = map { "'$_'" } @NewValues;
+my $new_values = join(',',@new_values);
+if ($current_table_definition->[1] =~ s/\`$Column\` enum\(('.*?')\)/\`$Column\` enum\($1,$new_values\)/s) {
+    $dbh->do("drop table if exists $TempDB.$Table") or die "could not make temporary table";
+    warn "making temporary table in $TempDB";
+    $dbh->do($current_table_definition->[1]) or die "could not make table";
+    warn "changing to use $DB";
+    $dbh->do("use $DB") or die "could not use $DB";
+    warn "flushing with a read lock";
+    $dbh->do('flush tables with read lock') or die "could not flush tables with read lock";
+    warn "Replacing the frms";
+    `cp -p $data_dir/$TempDB/$Table.frm $data_dir/$DB/$Table.frm`;
+    if ($!) {
+	warn "Copy failed: $@";
+	warn "Unlocking tables";
+	$dbh->do('unlock tables');
+	die;
+    }
+    warn "Unlocking tables";
+    $dbh->do('unlock tables') or die "unlocking tables failed";
+    warn "Success!!";
+    my $create_statement = $dbh->selectrow_arrayref("show create table $DB.$Table");
+    print $create_statement->[1];
+}
+else {
+    die "Could not find $Column on $DB.$Table";
+}
+

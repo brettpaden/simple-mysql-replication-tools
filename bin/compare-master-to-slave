@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+
+use strict;
+
+use DBI;
+use threads;
+use N2::SmallUtils qw/ascii_table/;
+use Curses;
+use Getopt::Declare;
+
+our $Master;
+our @hosts;
+our $Database;
+our $Stdout;
+
+my $specification = q(
+        [strict]
+	-m <master>	Master database (default is multmaster.pn)
+			{ $::Master = $master }
+	-s <slaves>	Slaves to monitor using doit -w specification (default is pn*multdb+db518)
+			{ $::Slaves = $slaves }
+	-d <database>	Databases to compare 
+			{ $::Database = $database }
+	-S		Don't run in interacivte mode; instead print results to stdout
+			{ $::Stdout++ }
+);
+Getopt::Declare->new($specification);
+
+my $mysql_user = 'root';
+my $mysql_pwd = $ENV{MYSQL_PWD};
+chomp @hosts;
+
+my $win = $Stdout ? undef : new Curses;
+
+while (1) {
+    my $threads = {};
+    my @headers = ('table',@hosts);
+    my @table = ([@headers]);
+
+    $threads->{'master'} = threads->create('table_status',$Master);
+    foreach my $host (@hosts) {
+	$threads->{$host} = threads->create('table_status',$host);
+    }
+    my $master_status = $threads->{'master'}->join();
+    my $slave_map = {};
+    foreach my $host (@hosts) {
+        my $slave_status = $threads->{$host}->join();
+        map { $slave_map->{$host}->{$_->[0]} = $_ } @$slave_status;
+    }
+    foreach my $table (@$master_status) {
+        my $row = [$table->[0]];
+        map { 
+            my $slave_val = $slave_map->{$_}->{$table->[0]}->[4];
+            push @$row, $slave_val && $table->[1] ne 'InnoDB' ? $table->[4]-$slave_val : 'n/a' 
+        } @hosts;
+        push @table, $row;
+    }
+    my $date = `date`;
+    chomp $date;
+
+    if ($win) {
+	$win->clear;
+	$win->addstr(0,0,$date);
+	my $y = 1;
+	my @lines = split(/\n/,ascii_table( @table ));
+	my @header = splice(@lines,0,4);
+	my @col_1 = @header;
+	push @col_1,@lines;
+	map $win->addstr($y++,0,$_), @col_1;
+	$win->refresh;
+    }
+    else {
+        print ascii_table(@table);
+        last;
+    }
+}
+
+sub table_status {
+    my $host = shift;
+    my $dbh = DBI->connect("DBI:mysql:host=$host;database=$Database",$mysql_user,$mysql_pwd);
+    my $tables = $dbh->selectall_arrayref('show table status');
+    return $tables;
+}
+

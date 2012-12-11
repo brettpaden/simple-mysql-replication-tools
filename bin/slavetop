@@ -1,0 +1,223 @@
+#!/usr/bin/perl
+
+# A simple utility for real-time monitoring of mysql slaves
+
+use DBI;
+use Curses;
+use Getopt::Declare;
+use Data::Dumper qw{Dumper};
+use threads; 
+use strict;
+
+our $LogFile;
+our @Hosts;
+our @Hosts = ();
+
+my $specification = q(
+
+        [strict]
+
+	-l <log>	Don't run in interacivte mode; instead log the entry to the specified file	
+			{ $::LogFile = $log }
+	-w <doit>	Hosts to run slavetop against in doit -w shortcut format.  Default is pn*multdb+db518
+			{ $::Source = $doit }
+	<hosts>...	If not using doit to look up hosts, user can enter list of hosts to check.		
+			{ @::Hosts = @hosts }
+);
+my $args = Getopt::Declare->new($specification);
+
+# use the doit utility to find ho
+chomp @Hosts;
+
+# sanity checks
+die "No hosts specified"       unless @Hosts;
+die "MYSQL_PWD is not defined" unless $ENV{MYSQL_PWD};
+
+# if we are writing to a log file we have no need of curses
+my $win = $LogFile ? undef : new Curses;
+
+# big bad hashref for storing data
+my $data = {};
+
+# loop FOREVER!
+while (1) {
+    my $threads = {};
+    my @table = (['host','connections_per_second','reads_per_second','writes_per_second','seconds_behind']);
+
+    # fire off a connection per host
+    map { $threads->{$_} = threads->create('slave_status', $_) } @Hosts;
+
+    # check our threads for results 
+    foreach my $host (@Hosts) {
+	my $status = $threads->{$host}->join();       # check for thread's return
+        push @{$data->{$host}}, $status if $status;   # put the status into our heap
+	trim_data($host);                             # clean up uneeeded data points
+        push @table, prepare_stats($host);            # format results and put in our table
+    }
+
+    next unless @table > 1;
+    my $date = mysql_timestamp();
+
+    # if we are in simple logging mode, write the output to specificed logfile and get out of loop
+    if ($LogFile) {
+        shift @table; # don't need the headers in the log file
+        open(LOG,">>$LogFile");
+        map { print LOG "$date\t" . join("\t",@$_) . "\n" }  @table;
+        last;
+    }
+
+    # ghetto curses ... just rewrite the whole screen
+    $win->clear;
+    $win->addstr(0,0,$date);
+    my $y = 1;
+    my @lines = split(/\n/, ascii_table(@table));
+    my @header = splice(@lines,0,4);
+    my @col_1 = @header;
+    push @col_1,@lines;
+    map $win->addstr($y++,0,$_), @col_1;
+    $win->refresh;
+}
+
+#-------------------------------------------------------------------------------
+sub trim_data {
+#-------------------------------------------------------------------------------
+# garbage collection; only keep 60 datapoints.  These numbers are used to calculate
+# a running average for certain stats
+    my $host = shift;
+    my $last_index = $#{$data->{$host}};
+    if ($last_index == 60) {
+	shift @{$data->{$host}};
+	$last_index--;
+    }
+}
+
+#-------------------------------------------------------------------------------
+sub prepare_stats {
+#-------------------------------------------------------------------------------
+# for each collection point, calculate and return stats
+    my $host = shift;
+    my $stats = $data->{$host};
+
+    # determine the amount of time that has passed in the past 60 samples
+    my $elapsed = $stats->[$#$stats]->{Uptime} - $stats->[0]->{Uptime};
+    next unless $elapsed;   
+
+    # calculate connections, reads, and writes.  
+    my $conns  = format_num(($stats->[$#$stats]->{Connections} - $stats->[0]->{Connections})/$elapsed);
+    my $reads  = format_num(($stats->[$#$stats]->{Com_select}  - $stats->[0]->{Com_select})/$elapsed);
+    my $writes = format_num((write_ops($stats->[$#$stats]) - write_ops($stats->[0]))/$elapsed);
+
+    # return the data we are interested in
+    return [$host, $conns, $reads, $writes, $stats->[$#$stats]->{Seconds_Behind_Master}];
+}
+
+#-------------------------------------------------------------------------------
+sub connect_db {
+#-------------------------------------------------------------------------------
+# quick and dirty DBI connection.  Don't need the overhead or requirements of our
+# entire system here
+    my $host = shift;
+    # since our output is realtime curses, we don't want to interrupt the display
+    # with annoyting stderr or other error messages.  Callers should handle no 
+    # db connection on their own.
+    my $dbh;
+    eval { $dbh = DBI->connect("DBI:mysql:host=$host;database=mysql","root",$ENV{MYSQL_PWD}) };
+    return $dbh;
+}
+
+#-------------------------------------------------------------------------------
+sub slave_status {
+#-------------------------------------------------------------------------------
+# connect to a slave and determine status.  Note that the connection is dropped
+# after each request.  Would have to tie up a connection *just* for monitoring
+    my $host = shift;
+    my $return = {};
+
+    # connect to db
+    my $dbh = connect_db($host);
+
+    # report no connection back up the chain
+    if (not $dbh) {
+	$return->{could_not_connect} = 1;
+	return $return;
+    }
+
+    # collect all the stats we might want to see and map into single hash
+    my $new    = $dbh->selectall_arrayref('show global status');
+    my $status = $dbh->selectrow_hashref('show slave status');
+    $return = $status;
+    map { $return->{$_->[0]} = $_->[1] } @$new;
+    return $status;
+}
+
+#-------------------------------------------------------------------------------
+sub mysql_timestamp {
+#-------------------------------------------------------------------------------
+# convert unix time to mysql time
+    my $seconds = shift || time;
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime($seconds);
+    $mon++;
+    $year += 1900;
+    $sec   = '0' . $sec  if length($sec)  == 1;
+    $min   = '0' . $min  if length($min)  == 1;
+    $hour  = '0' . $hour if length($hour) == 1;
+    $mon   = '0' . $mon  if length($mon)  == 1;
+    $mday  = '0' . $mday if length($mday) == 1;
+    return "$year-$mon-$mday $hour:$min:$sec";
+}
+
+#-------------------------------------------------------------------------------
+sub write_ops {
+#-------------------------------------------------------------------------------
+# sum the write operations from the mysql status lines
+    my $status = shift;
+    my $ops = $status->{Com_delete} + $status->{Com_update} + $status->{Com_insert};
+    return $ops;
+}
+
+#-------------------------------------------------------------------------------
+sub format_num {
+#-------------------------------------------------------------------------------
+# self explainatory
+    return sprintf('%.1f',shift);
+}
+
+
+#-------------------------------------------------------------------------------
+sub ascii_table {
+#-------------------------------------------------------------------------------
+# formats an array of array refs in a similar fashion to the output of a mysql
+# terminal using the first row as the header.
+#
+    my @table = @_;
+    
+    # determine the width of each cell in the output
+    my @size = ();
+    foreach my $row (@table) {
+        my $counter;
+        foreach my $element (@{$row}) {
+            $size[$counter] = length($element) if length($element) > $size[$counter];
+            $counter++;
+        }
+    }
+    my @sep = map '-' x $_,@size;
+    my $sep = '+-' . join('-+-',@sep) . '-+';
+    my $table = "\n$sep\n";
+
+    my $show_header;
+    foreach my $row (@table) {
+        my $counter;
+        $table .= "|";
+        foreach my $element (@{$row}) {
+            $element = pack('A' . $size[$counter++], $element);
+            $element =~ s/^([\-|\d|\.]+)(\s+)$/$2$1/;
+            $table .= " $element |";
+        }
+        $table .= "\n";
+        $table .= "$sep\n" if not $show_header++;
+    }
+    $table .= "$sep\n\n";
+
+    return $table;
+}
+

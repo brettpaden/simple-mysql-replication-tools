@@ -1,0 +1,203 @@
+#!/usr/bin/perl
+
+use strict;
+
+use DBI;
+use Getopt::Declare;
+use Time::HiRes qw/gettimeofday tv_interval/;
+
+our $RootDir;
+our $NoLinks = 0;
+our @DBs = ();
+our $ForceSlave;
+our $isMaster;
+our $Verbose;
+
+$SIG{INT} = \&clean_up;
+$SIG{__DIE__} = \&clean_up;
+# setup specification
+my $specification = q(
+	-M <host>	real master DB ... for double checking intergrity of host to be used as master data source
+			{ $::master_host = $host }
+	-d <dir>	dump data directory.
+			{ $::RootDir = $dir }
+	-nl		dont generate symlinks and or perform maintenence on a periodic backup directory
+			{ $::NoLinks++ }
+	-D <dbs>...	databases to backup.  Without this option the script automatically determines the best options
+			{ @::DBs = @dbs }
+	-fs		Even though localhost is a master databse, force dump from slaved databases
+			{ $::ForceSlave++ }
+	-v		verbose
+			{ $::Verbose++ }
+);
+my $args = Getopt::Declare->new($specification);
+
+# get the mysql root password
+my $password = `cat /etc/.mysql_root` | $ENV{MYSQL_PWD};
+chomp $password;
+die "No mysql root password available" unless $password;
+
+# setup the database connections
+msg("Connecting to local mysql instance...");
+my $dbh_source = DBI->connect("DBI:mysql:host=localhost",'root',$password);
+OK();
+
+# determine which dbs to automagically backup
+my $source_master_status = $dbh_source->selectrow_hashref('show master status');
+
+if ($source_master_status->{Binlog_Do_DB} and not $ForceSlave) {
+    msg("Localhost is a master db\n");
+    @DBs = split(/\,/,$source_master_status->{Binlog_Do_DB}) if not @DBs;
+    $isMaster++;
+}
+else {
+    msg("Localhost is slave database\n");
+    my $source_slave_status = $dbh_source->selectrow_hashref('show slave status');
+    msg("Connecting to master to verify slave status ... ");
+    my $dbh_master = DBI->connect("DBI:mysql:host=$source_slave_status->{Master_Host}",'root',$password); 
+    my $master_status = $dbh_master->selectrow_hashref('show master status');
+    die "localhost is not currently slaving to $source_slave_status->{Master_Host}" if $source_slave_status->{Slave_IO_Running} ne 'Yes' or $source_slave_status->{Slave_SQL_Running} ne 'Yes';
+
+    my $msg="Master host is $source_slave_status->{Master_Host}\n";
+    if ($master_status->{File} ne $source_slave_status->{Master_Log_File}){
+	die "File($master_status->{File}) and Master_Log_File($source_slave_status->{Master_Log_File}) do not match\n$msg";
+    }
+    if($master_status->{Position} >  $source_slave_status->{Exec_Master_Log_Pos} + 50_000_000){
+	my $log_pos_delta=$master_status->{Position} - $source_slave_status->{Exec_Master_Log_Pos};
+	die "Log position too large (Position=$master_status->{Position}, Exec_Master_Log_Pos=$source_slave_status->{Exec_Master_Log_Pos}, Delta=$log_pos_delta)\n$msg";
+    }
+    if($source_slave_status->{Seconds_Behind_Master} > 10_000){
+	die "Localhost is $source_slave_status->{Seconds_Behind_Master} seconds behind the master\n$msg";
+    }
+    OK();
+    @DBs = split(/\,/,$source_slave_status->{Replicate_Do_DB}) if not @DBs;
+}
+
+# create a directory to put this dump into
+my $backup_dir = "$RootDir/" . unpretty_timestamp();
+my $mkdir = `mkdir -p $backup_dir`;
+die "mkdir error for $backup_dir" if $?;
+my $state_file = "$backup_dir/state.xml";
+msg("Preparing to backup: " . join(', ',@DBs) . " to $backup_dir\n");
+
+my ($link,$backup_link);
+unless ($NoLinks) { 
+    $link = "$RootDir/latest";
+    $backup_link = "$RootDir/backup";
+}
+
+# stop writes to the databases being backed up and dump status
+my $xml_dbs;
+map { $xml_dbs .= "<database>$_</database>\n" } @DBs;
+if ($isMaster) {
+    msg("Locking tables and dumping status to $state_file...");
+    $dbh_source->do('flush tables with read lock');
+    die $dbh_source->err_str if $dbh_source->err;
+    my $save_status = $dbh_source->selectrow_hashref('show master status');
+    die $dbh_source->err_str if $dbh_source->err;
+    my ($host,$cruft) = ($save_status->{File} =~ /^(.*?)-(.*)$/);
+    open(OUT,">$state_file");
+    print OUT <<EOF;
+<mysql_backup_status>
+<master_file>$save_status->{File}</master_file>
+<master_position>$save_status->{Position}</master_position>
+<master_host>$host</master_host>
+$xml_dbs
+<source_type>master</source_type>
+</mysql_backup_status>
+EOF
+    close OUT;
+    OK();
+}
+else {
+    msg("Stopping slave ...");
+    $dbh_source->do('stop slave') unless $isMaster;
+    OK();
+
+    msg("Flushing tables with read lock ...");
+    $dbh_source->do('flush tables with read lock');
+    die $dbh_source->err_str if $dbh_source->err;
+    OK();
+
+    msg("Saving status to $state_file ...");
+    my $save_status = $dbh_source->selectrow_hashref('show slave status');
+    die $dbh_source->err_str if $dbh_source->err;
+    open(OUT,">$state_file");
+    print OUT <<EOF;
+<mysql_backup_status>
+<master_file>$save_status->{Master_Log_File}</master_file>
+<master_position>$save_status->{Exec_Master_Log_Pos}</master_position>
+<master_host>$save_status->{Master_Host}</master_host>
+$xml_dbs
+<source_type>slave</source_type>
+</mysql_backup_status>
+EOF
+    close OUT;
+    OK();
+}
+
+
+# cp the dbs to the backup dir
+foreach my $db (@DBs) {
+    msg("Copying tables for $db ...");
+    my $copy = `cp -pr /var/lib/mysql/$db $backup_dir && chown web:web -R $backup_dir`;
+    die "Oh shit ... cp of actual db tables crapped out: $copy" if $?;
+    OK();
+}
+
+unless ($NoLinks) {
+    msg("Generating links ...");
+    if (-e $link) {
+	if (-e $backup_link) {
+	    my $remove = readlink($backup_link);
+	    my $cmd = `rm -rf $remove`;
+            warn "Unable to remove $remove: $cmd" if $?;
+	    $cmd = `rm $backup_link`;
+            warn "Unable to remove $backup_link: $cmd" if $?;
+	}
+	my $target = readlink($link);
+	my $cmd = `ln -s $target $backup_link`;
+	warn "Unable to create link to $target: $cmd" if $?;
+        $cmd = `rm $link`;
+        warn "Unable to remove $link: $cmd" if $?;
+    }
+    my $cmd = `ln -s $backup_dir $link`;
+    warn "Unable to link $backup_dir to $link: $cmd" if $?;
+    OK();
+}
+
+# clean up
+clean_up();
+
+sub clean_up {
+    if ($dbh_source) {
+        print "Unlocking tables..." if $Verbose;
+        $dbh_source->do('unlock tables');
+        die $dbh_source->err_str if $dbh_source->err;
+        OK();
+        print "Starting slave ..." if $Verbose;
+        $dbh_source->do('start slave') unless $isMaster;
+        die $dbh_source->err_str if $dbh_source->err;
+        OK();
+    }
+}
+
+sub OK {
+    print "[OK]\n" if $Verbose;
+}
+
+sub msg {
+    print shift if $Verbose;
+}
+
+sub unpretty_timestamp {
+    my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(time);
+    $mon++;
+    $year += 1900;
+    $mon = '0' . $mon if $mon < 10;
+    $mday = '0' . $mday if $mday < 10;
+    $hour = '0' . $hour if $hour < 10;
+    $min = '0' . $min if $min < 10;
+    return "$year$mon$mday$hour$min";
+}
+

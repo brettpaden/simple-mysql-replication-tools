@@ -1,0 +1,139 @@
+#!/usr/bin/perl
+
+use POSIX;
+use DBI;
+use Getopt::Declare;
+
+our $LogFile;
+our $OperationReportFile;
+our $QueryReportFile;
+
+my $specification = q[
+	-oo <file>	    Operations report output file (defaults to STDOUT);
+			    { $::OperationReportFile = $file }
+	-qo <file>	    Query report output file (defaults to STDOUT);
+			    { $::QueryReportFile = $file }
+	<logfile>	    Logfile to process; defaults to whatever the mysql server thinks its log file is
+			    { $::LogFile = $logfile }
+];
+my $args = Getopt::Declare->new($specification);
+
+# these are commands that result in a data noop; while important to track from a cpu and network io 
+# standpoint, they are unlikely to affect performance
+my $data_noop = {
+    ERROR => 1,
+    SET => 1,
+    SHOW => 1,
+    DESC => 1,
+};
+
+my $report = {};
+my $commands = {};
+my $start_time;
+my $end_time;
+my $totals = {};
+
+my $password = $ENV{MYSQL_PWD} || `cat /etc/.mysql_root` || die 'could not find mysql root password';
+chomp $password;
+
+if (not $LogFile) {
+    my $dbh = DBI->connect('DBI:mysql:hostname=localhost','root',$password) || die 'could not connect to local database as root';
+    my $datadir = $dbh->selectrow_arrayref("show global variables like 'datadir'");
+    my $short_hostname = `hostname --short`;
+    chomp $short_hostname;
+    $LogFile = $datadir->[1] . "/$short_hostname.log";
+    `mv $LogFile $LogFile.process`;
+    $dbh->do('flush logs');
+    $dbh->disconnect;
+    $LogFile = "$LogFile.process";
+}
+
+open(LOG,$LogFile);
+while(<LOG>) {
+    next if not /^[\s\d]/;
+    chomp;
+    my ($date, $time, $thread_id, $type, $info);
+    if (/^\t\t/) {
+        ($thread_id, $type, $info) = /^\t\t\s*(.*?)\s+(.*?)\s+(.*)/;
+    }
+    else {
+        ($date, $time, $thread_id, $type, $info) = /^(.*?)\s+(.*?)\s+(.*?)\s+(.*?)\s+(.*)/;
+    }
+    next if $date =~ /[a-zA-Z]/;
+    $start_time = "$date $time" if not $start_time and $date =~ /\d+/;
+    $end_time = "$date $time" if $date =~ /\d+/;
+
+    $totals->{$type}++; 
+
+    if ($type eq 'Query') {
+        my $select;
+        my @sql = split(/\s+/,$info);
+        my $command = uc shift(@sql);
+        my $table = 'noop';
+
+        # lets see if we can figure out the table we are operating on for our major read and write operations
+        if ($data_noop->{$command}) {
+            $table = 'noop'; 
+        }
+        elsif ($command eq 'INSERT') {
+            $table = $sql[1];
+            $table = $sql[2] if $table eq 'ignore';
+        }
+        elsif ($command eq 'CREATE') {
+            while(uc(shift @sql) ne 'TABLE') { next };
+            $table = $sql[0];
+        } 
+        elsif ($command eq 'UPDATE') {
+            $table = $sql[0];
+        }
+        elsif ($command eq 'SELECT' or $command eq 'DELETE') {
+            my @tables;
+            while (uc(shift @sql) ne 'FROM' and @sql) { next };
+	    push @tables,'non_table' if not @sql;
+            while (my $t = shift @sql) { 
+                $t=~ s/\,//; 
+                if ($t eq 'as') { 
+                    shift @sql; 
+                    next 
+                }; 
+                next if not $t; 
+                last if uc $t eq 'WHERE';
+                last if uc $t eq 'USE';
+                push @tables,$t;
+            }
+            $table = join('-',@tables); 
+        }
+        $commands->{$command}->{$table}++;
+    }
+}
+
+my $elapsed = date_to_time($end_time) - date_to_time($start_time);
+my $start = format_mysql_date($start_time);
+my $end = format_mysql_date($end_time);
+
+my $handle = STDOUT;
+open($handle,">$OperationReportFile") if $OperationReportFile;
+foreach my $type (keys %$totals) {
+    print $handle "$start\t$elapsed\t$type\t$totals->{$type}\n";
+}
+
+$handle = STDOUT;
+open($handle,">$QueryReportFile") if $OperationReportFile;
+foreach my $type (keys %$commands) {
+    foreach my $table (keys %{$commands->{$type}}) {
+        print $handle "$start\t$elapsed\t$type\t$table\t$commands->{$type}->{$table}\n";
+    }
+}
+
+sub format_mysql_date {
+    my $date = shift;
+    $date =~ s/(..)(..)(..) (.*)/20$1-$2-$3 $4/;
+    return $date;
+}
+
+sub date_to_time {
+    my $date = shift;
+    my ($Y,$M,$D,$h,$m,$s) = ($date =~ m/(..)(..)(..) (..):(..):(..)/);
+    $Y += 100;
+    return mktime($s,$m,$h,$D,$M,$Y);
+}
